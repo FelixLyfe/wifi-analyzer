@@ -36,6 +36,7 @@ export function demoDiagnostics(): ConnectionDiagnosticReport {
     checkedAt: new Date().toISOString(),
     overall: "healthy",
     summary: "WiFi、DNS 与互联网连接均正常。",
+    connection: { ssid: "Studio-5G", bssid: "8c:85:90:42:11:01" },
     checks: [
       {
         id: "wifi",

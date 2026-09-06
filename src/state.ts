@@ -21,6 +21,8 @@ export interface AppState {
   diagnostics?: ConnectionDiagnosticReport;
   diagnosticBusy: boolean;
   diagnosticError?: string;
+  diagnosticStale: boolean;
+  connectionRevision: number;
 }
 
 export function createInitialState(): AppState {
@@ -29,6 +31,8 @@ export function createInitialState(): AppState {
     autoScan: true,
     busy: false,
     diagnosticBusy: false,
+    diagnosticStale: false,
+    connectionRevision: 0,
   };
 }
 
@@ -48,5 +52,22 @@ export function getSelectedNetwork(state: AppState): WifiNetwork | undefined {
 }
 
 export function getCurrentNetwork(state: AppState): WifiNetwork | undefined {
+  if (state.scanIssue) {
+    return undefined;
+  }
   return state.scan?.networks.find((network) => network.isConnected);
+}
+
+export function diagnosticMatchesScan(report: ConnectionDiagnosticReport, scan?: ScanResult): boolean {
+  if (!scan) {
+    return true;
+  }
+  const current = scan.networks.find((network) => network.isConnected);
+  if (!report.connection || !current) {
+    return !report.connection && !current;
+  }
+  if (report.connection.bssid) {
+    return report.connection.bssid.toLowerCase() === current.bssid.toLowerCase();
+  }
+  return report.connection.ssid === current.ssid;
 }

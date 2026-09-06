@@ -1,3 +1,4 @@
+use crate::{command_text, wifi::ConnectionIdentity};
 use chrono::Utc;
 use serde::Serialize;
 use std::{
@@ -61,6 +62,8 @@ pub struct ConnectionDiagnosticReport {
     pub overall: DiagnosticOverall,
     pub summary: String,
     pub checks: Vec<DiagnosticCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ConnectionIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,8 +73,8 @@ struct PingMetrics {
     packet_loss_percent: Option<u8>,
 }
 
-pub fn run(current_wifi_ssid: Option<String>) -> ConnectionDiagnosticReport {
-    let wifi = wifi_check(current_wifi_ssid.as_deref());
+pub fn run(connection: Option<ConnectionIdentity>) -> ConnectionDiagnosticReport {
+    let wifi = wifi_check(connection.as_ref().map(|value| value.ssid.as_str()));
     let gateway_probe = thread::spawn(gateway_check);
     let dns_probe = thread::spawn(dns_check);
     let internet_probe = thread::spawn(internet_check);
@@ -91,6 +94,7 @@ pub fn run(current_wifi_ssid: Option<String>) -> ConnectionDiagnosticReport {
         overall,
         summary,
         checks: vec![wifi, gateway, dns, internet],
+        connection,
     }
 }
 
@@ -288,6 +292,12 @@ fn summarize(
             "外部网络可达，但 DNS 解析异常。".to_string(),
         );
     }
+    if internet_reachable {
+        return (
+            DiagnosticOverall::Degraded,
+            "互联网可达，但检测到丢包，连接质量下降。".to_string(),
+        );
+    }
     if gateway_ok {
         return (
             DiagnosticOverall::Degraded,
@@ -319,7 +329,7 @@ fn default_gateway() -> Option<String> {
         if !output.status.success() {
             return None;
         }
-        parse_macos_default_gateway(&String::from_utf8_lossy(&output.stdout))
+        parse_macos_default_gateway(&command_text::decode(&output.stdout))
     }
 
     #[cfg(target_os = "windows")]
@@ -333,7 +343,7 @@ fn default_gateway() -> Option<String> {
         if !output.status.success() {
             return None;
         }
-        parse_windows_default_gateway(&String::from_utf8_lossy(&output.stdout))
+        parse_windows_default_gateway(&command_text::decode(&output.stdout))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -375,16 +385,20 @@ fn ping_target(target: &str) -> Result<PingMetrics, String> {
     let output = output.map_err(|error| error.to_string())?;
     let raw = format!(
         "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        command_text::decode(&output.stdout),
+        command_text::decode(&output.stderr)
     );
-    let packet_loss_percent = parse_packet_loss(&raw);
+    Ok(parse_ping_metrics(&raw, output.status.success()))
+}
 
-    Ok(PingMetrics {
-        reachable: output.status.success() || packet_loss_percent.is_some_and(|loss| loss < 100),
-        latency_ms: parse_average_latency(&raw),
+fn parse_ping_metrics(raw: &str, command_succeeded: bool) -> PingMetrics {
+    let packet_loss_percent = parse_packet_loss(raw);
+
+    PingMetrics {
+        reachable: packet_loss_percent.map_or(command_succeeded, |loss| loss < 100),
+        latency_ms: parse_average_latency(raw),
         packet_loss_percent,
-    })
+    }
 }
 
 fn parse_packet_loss(raw: &str) -> Option<u8> {
@@ -394,14 +408,16 @@ fn parse_packet_loss(raw: &str) -> Option<u8> {
             .chars()
             .rev()
             .skip_while(|ch| ch.is_whitespace())
-            .take_while(|ch| ch.is_ascii_digit())
+            .take_while(|ch| ch.is_ascii_digit() || *ch == '.' || *ch == ',')
             .collect();
         if digits_reversed.is_empty() {
             continue;
         }
         let digits: String = digits_reversed.chars().rev().collect();
-        if let Ok(value) = digits.parse::<u8>() {
-            return Some(value.min(100));
+        if let Ok(value) = digits.replace(',', ".").parse::<f64>() {
+            if (0.0..=100.0).contains(&value) {
+                return Some(value.round() as u8);
+            }
         }
     }
     None
@@ -516,6 +532,57 @@ mod tests {
         let raw = "3 packets transmitted, 3 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 1.123/2.456/4.100/0.800 ms\n";
         assert_eq!(parse_packet_loss(raw), Some(0));
         assert_eq!(parse_average_latency(raw), Some(2));
+    }
+
+    #[test]
+    fn preserves_decimal_packet_loss_including_total_loss() {
+        for (raw, expected) in [
+            (
+                "3 packets transmitted, 0 packets received, 100.0% packet loss",
+                100,
+            ),
+            (
+                "3 packets transmitted, 2 packets received, 33.3% packet loss",
+                33,
+            ),
+            (
+                "3 packets transmitted, 1 packets received, 66.7% packet loss",
+                67,
+            ),
+            (
+                "3 packets transmitted, 3 packets received, 0.0% packet loss",
+                0,
+            ),
+        ] {
+            assert_eq!(parse_packet_loss(raw), Some(expected), "{raw}");
+        }
+    }
+
+    #[test]
+    fn total_loss_is_unreachable_and_partial_replies_remain_reachable() {
+        for exit_success in [false, true] {
+            assert!(!parse_ping_metrics("100.0% packet loss", exit_success).reachable);
+        }
+        let partial = parse_ping_metrics("33.3% packet loss", false);
+        assert!(partial.reachable);
+        assert_eq!(partial.packet_loss_percent, Some(33));
+    }
+
+    #[test]
+    fn reachable_internet_with_loss_is_degraded_even_without_gateway_ping() {
+        let wifi = check(DiagnosticCheckId::Wifi, DiagnosticStatus::Pass);
+        let dns = check(DiagnosticCheckId::Dns, DiagnosticStatus::Pass);
+        let internet = check(DiagnosticCheckId::Internet, DiagnosticStatus::Warning);
+        for status in [
+            DiagnosticStatus::Pass,
+            DiagnosticStatus::Warning,
+            DiagnosticStatus::Fail,
+        ] {
+            let gateway = check(DiagnosticCheckId::Gateway, status);
+            let (overall, summary) = summarize(&wifi, &gateway, &dns, &internet);
+            assert_eq!(overall, DiagnosticOverall::Degraded);
+            assert!(summary.contains("丢包"));
+        }
     }
 
     #[test]

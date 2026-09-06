@@ -73,4 +73,5 @@ export interface ConnectionDiagnosticReport {
   overall: DiagnosticOverall;
   summary: string;
   checks: DiagnosticCheck[];
+  connection?: { ssid: string; bssid?: string };
 }

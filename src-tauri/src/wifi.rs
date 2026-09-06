@@ -1,3 +1,4 @@
+use crate::command_text;
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -9,7 +10,7 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "macos")]
 use objc2_core_location::{CLAuthorizationStatus, CLLocationManager};
 #[cfg(target_os = "macos")]
-use objc2_core_wlan::{CWNetwork, CWSecurity, CWWiFiClient};
+use objc2_core_wlan::{CWChannelBand, CWNetwork, CWSecurity, CWWiFiClient};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,7 +28,58 @@ pub struct WifiNetwork {
     pub is_connected: bool,
 }
 
-#[derive(Debug, Clone)]
+impl WifiNetwork {
+    fn with_band(mut self, band: Option<WifiBand>) -> Self {
+        if let Some(band) = band {
+            self.frequency_mhz = band.frequency(self.channel);
+            self.band = band.label().to_string();
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WifiBand {
+    Ghz2,
+    Ghz5,
+    Ghz6,
+}
+
+impl WifiBand {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ghz2 => "2.4GHz",
+            Self::Ghz5 => "5GHz",
+            Self::Ghz6 => "6GHz",
+        }
+    }
+
+    fn frequency(self, channel: u16) -> u16 {
+        match (self, channel) {
+            (Self::Ghz2, 1..=13) => 2407 + channel * 5,
+            (Self::Ghz2, 14) => 2484,
+            (Self::Ghz5, 1..=177) => 5000 + channel * 5,
+            (Self::Ghz6, 2) => 5935,
+            (Self::Ghz6, 1..=233) => 5950 + channel * 5,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NetworkChannel {
+    number: u16,
+    band: Option<WifiBand>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionIdentity {
+    pub ssid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bssid: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct CurrentConnection {
     ssid: String,
     bssid: Option<String>,
@@ -289,7 +341,8 @@ fn scan_core_wlan() -> Result<Vec<WifiNetwork>, String> {
             ssid: value.to_string(),
             bssid: interface
                 .bssid()
-                .map(|value| value.to_string().to_ascii_lowercase()),
+                .map(|value| value.to_string().to_ascii_lowercase())
+                .filter(|value| is_mac_address(value)),
             channel: interface
                 .wlanChannel()
                 .map(|value| value.channelNumber().clamp(0, u16::MAX as isize) as u16),
@@ -314,23 +367,32 @@ fn scan_core_wlan() -> Result<Vec<WifiNetwork>, String> {
 
             let channel = network
                 .wlanChannel()
-                .map(|value| value.channelNumber().clamp(0, u16::MAX as isize) as u16)
-                .unwrap_or(0);
+                .map(|value| NetworkChannel {
+                    number: value.channelNumber().clamp(0, u16::MAX as isize) as u16,
+                    band: match value.channelBand() {
+                        CWChannelBand::Band2GHz => Some(WifiBand::Ghz2),
+                        CWChannelBand::Band5GHz => Some(WifiBand::Ghz5),
+                        CWChannelBand::Band6GHz => Some(WifiBand::Ghz6),
+                        _ => None,
+                    },
+                })
+                .unwrap_or_default();
             let bssid = network
                 .bssid()
                 .map(|value| value.to_string().to_ascii_lowercase())
                 .filter(|value| is_mac_address(value))
-                .unwrap_or_else(|| synthetic_bssid(&ssid, channel, networks.len()));
+                .unwrap_or_else(|| synthetic_bssid(&ssid, channel.number, networks.len()));
             let parsed = make_network(
                 ssid.clone(),
                 bssid.clone(),
                 network
                     .rssiValue()
                     .clamp(i32::MIN as isize, i32::MAX as isize) as i32,
-                channel,
+                channel.number,
                 core_wlan_security(&network),
                 None,
-            );
+            )
+            .with_band(channel.band);
             networks.push(parsed);
         }
 
@@ -487,8 +549,8 @@ fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
         .map_err(|err| format!("Failed to run {program}: {err}"))?;
 
     if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = command_text::decode(&output.stdout).trim().to_string();
+        let stderr = command_text::decode(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
             if stdout.is_empty() {
                 format!("{program} exited with status {}", output.status)
@@ -500,7 +562,7 @@ fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
         });
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(command_text::decode(&output.stdout))
 }
 
 #[cfg(target_os = "macos")]
@@ -554,6 +616,7 @@ fn parse_airport(raw: &str) -> Vec<WifiNetwork> {
 struct SystemProfilerNetwork {
     ssid: String,
     channel: u16,
+    band: Option<WifiBand>,
     signal_dbm: Option<i32>,
     security: String,
     is_connected: bool,
@@ -603,6 +666,7 @@ fn parse_system_profiler_airport(raw: &str) -> Vec<WifiNetwork> {
 
         if let Some(value) = trimmed.strip_prefix("Channel:") {
             network.channel = parse_channel(value.trim()).unwrap_or(0);
+            network.band = parse_channel_band(value);
         } else if let Some(value) = trimmed.strip_prefix("Security:") {
             network.security = value.trim().to_string();
         } else if let Some(value) = trimmed.strip_prefix("Signal / Noise:") {
@@ -637,7 +701,8 @@ fn push_system_profiler_network(
         network.channel,
         network.security,
         None,
-    );
+    )
+    .with_band(network.band);
     parsed.is_connected = network.is_connected;
     networks.push(parsed);
 }
@@ -653,7 +718,7 @@ fn is_system_profiler_section_boundary(trimmed: &str) -> bool {
 // 以下各平台解析函数在所有平台编译，以便单元测试跨平台覆盖；
 // 仅在未使用的平台上豁免 dead_code。
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn parse_windows_netsh(raw: &str) -> Vec<WifiNetwork> {
+pub(crate) fn parse_windows_netsh(raw: &str) -> Vec<WifiNetwork> {
     if looks_like_netsh_interfaces(raw) {
         let interfaces = parse_netsh_interfaces(raw);
         if !interfaces.is_empty() {
@@ -684,7 +749,7 @@ fn parse_netsh(raw: &str) -> Vec<WifiNetwork> {
     let mut current_security = String::from("Unknown");
     let mut current_bssid = String::new();
     let mut current_quality: Option<u8> = None;
-    let mut current_channel: Option<u16> = None;
+    let mut current_channel = NetworkChannel::default();
 
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -700,7 +765,7 @@ fn parse_netsh(raw: &str) -> Vec<WifiNetwork> {
             );
             current_bssid.clear();
             current_quality = None;
-            current_channel = None;
+            current_channel = NetworkChannel::default();
             current_ssid = value_after_colon(trimmed).unwrap_or_default().to_string();
         } else if trimmed.starts_with("Authentication") || trimmed.starts_with("身份验证") {
             current_security = value_after_colon(trimmed).unwrap_or("Unknown").to_string();
@@ -717,12 +782,19 @@ fn parse_netsh(raw: &str) -> Vec<WifiNetwork> {
                 .unwrap_or_default()
                 .to_lowercase();
             current_quality = None;
-            current_channel = None;
+            current_channel = NetworkChannel::default();
         } else if trimmed.starts_with("Signal") || trimmed.starts_with("信号") {
             current_quality = value_after_colon(trimmed)
                 .and_then(|value| value.trim_end_matches('%').trim().parse::<u8>().ok());
-        } else if trimmed.starts_with("Channel") || trimmed.starts_with("频道") {
-            current_channel = value_after_colon(trimmed).and_then(parse_channel);
+        } else if trimmed.starts_with("Channel")
+            || trimmed.starts_with("频道")
+            || trimmed.starts_with("信道")
+        {
+            current_channel.number = value_after_colon(trimmed)
+                .and_then(parse_channel)
+                .unwrap_or(0);
+        } else if is_netsh_band_field(trimmed) {
+            current_channel.band = value_after_colon(trimmed).and_then(parse_channel_band);
         }
     }
 
@@ -745,7 +817,7 @@ fn parse_netsh_interfaces(raw: &str) -> Vec<WifiNetwork> {
     let mut current_security = String::from("Unknown");
     let mut current_bssid = String::new();
     let mut current_quality: Option<u8> = None;
-    let mut current_channel: Option<u16> = None;
+    let mut current_channel = NetworkChannel::default();
     let mut is_connected = false;
 
     for line in raw.lines() {
@@ -765,7 +837,7 @@ fn parse_netsh_interfaces(raw: &str) -> Vec<WifiNetwork> {
             current_security = String::from("Unknown");
             current_bssid.clear();
             current_quality = None;
-            current_channel = None;
+            current_channel = NetworkChannel::default();
             is_connected = false;
         } else if trimmed.starts_with("State") || trimmed.starts_with("状态") {
             is_connected = value_after_colon(trimmed)
@@ -782,8 +854,15 @@ fn parse_netsh_interfaces(raw: &str) -> Vec<WifiNetwork> {
         } else if trimmed.starts_with("Signal") || trimmed.starts_with("信号") {
             current_quality = value_after_colon(trimmed)
                 .and_then(|value| value.trim_end_matches('%').trim().parse::<u8>().ok());
-        } else if trimmed.starts_with("Channel") || trimmed.starts_with("频道") {
-            current_channel = value_after_colon(trimmed).and_then(parse_channel);
+        } else if trimmed.starts_with("Channel")
+            || trimmed.starts_with("频道")
+            || trimmed.starts_with("信道")
+        {
+            current_channel.number = value_after_colon(trimmed)
+                .and_then(parse_channel)
+                .unwrap_or(0);
+        } else if is_netsh_band_field(trimmed) {
+            current_channel.band = value_after_colon(trimmed).and_then(parse_channel_band);
         }
     }
 
@@ -807,7 +886,7 @@ fn push_netsh_interface_network(
     security: &str,
     bssid: &str,
     quality: Option<u8>,
-    channel: Option<u16>,
+    channel: NetworkChannel,
     is_connected: bool,
 ) {
     if !is_connected {
@@ -899,7 +978,7 @@ fn push_netsh_network(
     security: &str,
     bssid: &str,
     quality: Option<u8>,
-    channel: Option<u16>,
+    channel: NetworkChannel,
 ) {
     if ssid.is_empty() || !is_mac_address(bssid) {
         return;
@@ -908,14 +987,17 @@ fn push_netsh_network(
     let quality = quality.unwrap_or(0);
     let signal_dbm = quality_to_dbm(quality);
 
-    networks.push(make_network(
-        ssid.to_string(),
-        bssid.to_string(),
-        signal_dbm,
-        channel.unwrap_or(0),
-        security.to_string(),
-        Some(quality),
-    ));
+    networks.push(
+        make_network(
+            ssid.to_string(),
+            bssid.to_string(),
+            signal_dbm,
+            channel.number,
+            security.to_string(),
+            Some(quality),
+        )
+        .with_band(channel.band),
+    );
 }
 
 fn build_channel_distribution(networks: &[WifiNetwork]) -> Vec<ChannelDistribution> {
@@ -1002,8 +1084,9 @@ fn mark_current_connection_from(networks: &mut [WifiNetwork], current: Option<&C
             .find(|network| network.bssid.eq_ignore_ascii_case(current_bssid))
         {
             network.is_connected = true;
-            return;
         }
+        // A known BSSID is authoritative even when its AP was missed by this scan.
+        return;
     }
 
     let ssid_matches: Vec<usize> = networks
@@ -1042,8 +1125,11 @@ fn mark_current_connection_from(networks: &mut [WifiNetwork], current: Option<&C
     }
 }
 
-pub fn current_connection_name() -> Option<String> {
-    current_connection().map(|connection| connection.ssid)
+pub fn current_connection_identity() -> Option<ConnectionIdentity> {
+    current_connection().map(|connection| ConnectionIdentity {
+        ssid: connection.ssid,
+        bssid: connection.bssid,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1056,7 +1142,8 @@ fn current_connection() -> Option<CurrentConnection> {
                     ssid: ssid.to_string(),
                     bssid: interface
                         .bssid()
-                        .map(|value| value.to_string().to_ascii_lowercase()),
+                        .map(|value| value.to_string().to_ascii_lowercase())
+                        .filter(|value| is_mac_address(value)),
                     channel: interface
                         .wlanChannel()
                         .map(|value| value.channelNumber().clamp(0, u16::MAX as isize) as u16),
@@ -1095,37 +1182,40 @@ fn current_connection() -> Option<CurrentConnection> {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_netsh_current_connection(raw: &str) -> Option<CurrentConnection> {
     let mut connected = false;
-    let mut ssid = None;
-    let mut bssid = None;
-    let mut channel = None;
-    let mut signal_dbm = None;
+    let mut current = CurrentConnection::default();
 
     for line in raw.lines() {
         let trimmed = line.trim();
 
-        if trimmed.starts_with("State") || trimmed.starts_with("状态") {
+        if (trimmed.starts_with("Name") || trimmed.starts_with("名称")) && trimmed.contains(':') {
+            if connected && !current.ssid.is_empty() {
+                return Some(current);
+            }
+            connected = false;
+            current = CurrentConnection::default();
+        } else if trimmed.starts_with("State") || trimmed.starts_with("状态") {
             connected = value_after_colon(trimmed)
                 .map(is_connected_netsh_state)
                 .unwrap_or(false);
         } else if trimmed.starts_with("SSID") && !trimmed.starts_with("BSSID") {
-            ssid = value_after_colon(trimmed).map(str::to_string);
+            current.ssid = value_after_colon(trimmed).unwrap_or_default().to_string();
         } else if trimmed.starts_with("BSSID") {
-            bssid = value_after_colon(trimmed).map(|value| value.to_ascii_lowercase());
-        } else if trimmed.starts_with("Channel") || trimmed.starts_with("信道") {
-            channel = value_after_colon(trimmed).and_then(parse_channel);
+            current.bssid = value_after_colon(trimmed)
+                .filter(|value| is_mac_address(value))
+                .map(|value| value.to_ascii_lowercase());
+        } else if trimmed.starts_with("Channel")
+            || trimmed.starts_with("信道")
+            || trimmed.starts_with("频道")
+        {
+            current.channel = value_after_colon(trimmed).and_then(parse_channel);
         } else if trimmed.starts_with("Signal") || trimmed.starts_with("信号") {
-            signal_dbm = value_after_colon(trimmed)
-                .and_then(|value| value.trim_end_matches('%').parse::<u8>().ok())
+            current.signal_dbm = value_after_colon(trimmed)
+                .and_then(|value| value.trim_end_matches('%').trim().parse::<u8>().ok())
                 .map(quality_to_dbm);
         }
     }
 
-    connected.then_some(CurrentConnection {
-        ssid: ssid.filter(|value| !value.is_empty())?,
-        bssid: bssid.filter(|value| is_mac_address(value)),
-        channel,
-        signal_dbm,
-    })
+    (connected && !current.ssid.is_empty()).then_some(current)
 }
 
 #[cfg(target_os = "macos")]
@@ -1200,6 +1290,25 @@ fn parse_signal_dbm(value: &str) -> Option<i32> {
 fn parse_channel(value: &str) -> Option<u16> {
     let digits: String = value.chars().take_while(|ch| ch.is_ascii_digit()).collect();
     digits.parse::<u16>().ok()
+}
+
+fn parse_channel_band(value: &str) -> Option<WifiBand> {
+    value.split(['(', ')', ',']).find_map(|part| {
+        let normalized: String = part.chars().filter(|ch| !ch.is_whitespace()).collect();
+        match normalized.to_ascii_lowercase().as_str() {
+            "2ghz" | "2.4ghz" => Some(WifiBand::Ghz2),
+            "5ghz" => Some(WifiBand::Ghz5),
+            "6ghz" => Some(WifiBand::Ghz6),
+            _ => None,
+        }
+    })
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_netsh_band_field(line: &str) -> bool {
+    ["Band", "频段", "频带", "波段"]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
 }
 
 fn is_mac_address(value: &str) -> bool {
@@ -1320,6 +1429,69 @@ Signal                 : 86%
         assert_eq!(current.bssid.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
         assert_eq!(current.channel, Some(149));
         assert_eq!(current.signal_dbm, Some(-57));
+    }
+
+    #[test]
+    fn preserves_connected_interface_when_another_adapter_is_disconnected() {
+        let connected = "Name : Wi-Fi\nState : connected\nSSID : Studio\nBSSID : aa:bb:cc:dd:ee:ff\nSignal : 86%\nChannel : 149\n";
+        let disconnected = "Name : Wi-Fi 2\nState : disconnected\n";
+        for raw in [
+            format!("{connected}\n{disconnected}"),
+            format!("{disconnected}\n{connected}"),
+        ] {
+            let current = parse_netsh_current_connection(&raw).expect("the active adapter");
+            assert_eq!(current.ssid, "Studio");
+            assert_eq!(current.bssid.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        }
+    }
+
+    #[test]
+    fn keeps_explicit_6ghz_band_for_overlapping_channel_numbers() {
+        for (channel, frequency) in [(5, 5975), (37, 6135), (149, 6695)] {
+            let raw = format!("SSID 1 : Lab-6E\nAuthentication : WPA3-Personal\nBSSID 1 : aa:bb:cc:dd:ee:ff\nSignal : 86%\nBand : 6 GHz\nChannel : {channel}\n");
+            let rows = parse_windows_netsh(&raw);
+            assert_eq!(rows[0].band, "6GHz");
+            assert_eq!(rows[0].frequency_mhz, frequency);
+            assert_eq!(build_channel_distribution(&rows)[0].band, "6GHz");
+        }
+    }
+
+    #[test]
+    fn parses_6ghz_band_in_connected_interface_fallback() {
+        let raw = "Name : Wi-Fi\nState : connected\nSSID : Lab-6E\nBSSID : aa:bb:cc:dd:ee:ff\nSignal : 86%\nBand : 6 GHz\nChannel : 37\n";
+        let rows = parse_windows_netsh(raw);
+        assert_eq!(rows[0].band, "6GHz");
+        assert_eq!(rows[0].frequency_mhz, 6135);
+        assert!(rows[0].is_connected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preserves_system_profiler_band_context() {
+        let raw = "Current Network Information:\n  Lab-6E:\n    Channel: 37 (6GHz, 80MHz)\n    Security: WPA3 Personal\n    Signal / Noise: -48 dBm / -95 dBm\n";
+        let rows = parse_system_profiler_airport(raw);
+        assert_eq!(rows[0].band, "6GHz");
+        assert_eq!(rows[0].frequency_mhz, 6135);
+    }
+
+    #[test]
+    fn does_not_substitute_a_different_bssid_when_the_known_ap_is_missing() {
+        let mut networks = vec![make_network(
+            "Studio".to_string(),
+            "00:00:00:00:00:02".to_string(),
+            -43,
+            149,
+            "WPA2".to_string(),
+            None,
+        )];
+        let current = CurrentConnection {
+            ssid: "Studio".to_string(),
+            bssid: Some("00:00:00:00:00:01".to_string()),
+            channel: Some(149),
+            signal_dbm: Some(-43),
+        };
+        mark_current_connection_from(&mut networks, Some(&current));
+        assert!(!networks[0].is_connected);
     }
 
     #[test]

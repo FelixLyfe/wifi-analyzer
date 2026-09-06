@@ -180,19 +180,19 @@ export function render(state: AppState, handlers: RenderHandlers): void {
   const selected = getSelectedNetwork(state);
   const current = getCurrentNetwork(state);
 
-  setText("networkCount", scan ? String(scan.networks.length) : "0");
-  setText("currentSignal", current ? `${current.signalDbm} dBm` : scan ? "未连接" : "--");
-  setText("currentBand", current?.band ?? (scan ? "未连接" : "--"));
-  const sourceLabel = scan ? formatSourceLabel(scan.source) : state.scanIssue ? "扫描失败" : "待扫描";
+  setText("networkCount", state.scanIssue ? "--" : scan ? String(scan.networks.length) : "0");
+  setText("currentSignal", state.scanIssue ? "未知" : current ? `${current.signalDbm} dBm` : scan ? "未连接" : "--");
+  setText("currentBand", state.scanIssue ? "未知" : current?.band ?? (scan ? "未连接" : "--"));
+  const sourceLabel = state.scanIssue ? "扫描失败" : scan ? formatSourceLabel(scan.source) : "待扫描";
   setText("scanSource", sourceLabel);
-  mustGet<HTMLElement>("scanSource").title = scan?.source ?? sourceLabel;
-  setText("scanTime", scan ? formatTime(scan.scannedAt) : "--");
+  mustGet<HTMLElement>("scanSource").title = state.scanIssue?.title ?? scan?.source ?? sourceLabel;
+  setText("scanTime", scan ? `${state.scanIssue ? "上次成功 " : ""}${formatTime(scan.scannedAt)}` : "--");
 
   renderNetworks(state, scan?.networks ?? [], handlers);
   renderConnectionStatus(state, current, handlers);
   renderChannelDistribution(state, scan?.channelDistribution ?? [], current);
   renderCurve(state, selected);
-  renderSelectedDetail(selected);
+  renderSelectedDetail(selected, Boolean(state.scanIssue));
 
   createIcons({
     icons: {
@@ -419,46 +419,15 @@ function renderConnectionStatus(
 ): void {
   const root = mustGet<HTMLDivElement>("connectionStatus");
 
-  if (state.diagnosticBusy) {
-    root.className = "connection-status-list diagnostic-loading";
-    root.innerHTML = `
-      <div class="diagnostic-progress" role="status" aria-live="polite">
-        <i data-lucide="activity"></i>
-        <div>
-          <strong>正在逐层诊断</strong>
-          <p>检查 WiFi、默认网关、DNS 和互联网连接，通常需要几秒。</p>
-        </div>
-      </div>
-    `;
-    return;
-  }
-
-  if (state.diagnostics) {
-    renderDiagnosticReport(root, state.diagnostics, state.diagnosticError);
-    return;
-  }
-
-  if (state.diagnosticError) {
-    root.className = "connection-status-list";
-    root.innerHTML = `
-      <article class="connection-status-item warning" role="alert">
-        <i data-lucide="circle-x"></i>
-        <div>
-          <strong>诊断未完成</strong>
-          <p>${escapeHtml(state.diagnosticError)}</p>
-        </div>
-      </article>
-    `;
-    return;
-  }
-
-  if (!state.scan) {
+  if (!state.scan && !state.scanIssue && !state.diagnostics && !state.diagnosticBusy && !state.diagnosticError) {
     root.className = "connection-status-list empty-state";
     root.textContent = state.busy ? "正在读取当前连接" : "扫描 WiFi，或直接运行一键诊断";
     return;
   }
 
-  const items = buildConnectionStatus(current);
+  const items: ReturnType<typeof buildConnectionStatus> = state.scanIssue
+    ? [{ tone: "notice", icon: "wifi-off", title: "当前连接状态未知", detail: "扫描失败，无法确认当前 WiFi 的信号和安全状态。请重新扫描。" }]
+    : state.scan ? buildConnectionStatus(current) : [];
   root.className = "connection-status-list";
   root.innerHTML = `${items
     .map(
@@ -483,31 +452,48 @@ function renderConnectionStatus(
         : ""
     }`;
 
+  if (state.diagnosticBusy) {
+    root.innerHTML += `
+      <div class="diagnostic-progress" role="status" aria-live="polite">
+        <i data-lucide="activity"></i>
+        <div>
+          <strong>正在逐层诊断</strong>
+          <p>检查 WiFi、默认网关、DNS 和互联网连接，通常需要几秒。</p>
+        </div>
+      </div>
+    `;
+  } else {
+    if (state.diagnostics) {
+      root.innerHTML += renderDiagnosticReport(state.diagnostics, state.diagnosticStale);
+    }
+    if (state.diagnosticError) {
+      root.innerHTML += `<p class="status-error" role="alert">诊断未完成：${escapeHtml(state.diagnosticError)}</p>`;
+    }
+  }
+
   root.querySelector<HTMLButtonElement>('[data-action="open-wifi-settings"]')?.addEventListener("click", () => {
     handlers.onOpenWifiSettings();
   });
 }
 
 function renderDiagnosticReport(
-  root: HTMLDivElement,
   report: ConnectionDiagnosticReport,
-  error?: string,
-): void {
-  root.className = "connection-status-list diagnostic-report";
-  root.innerHTML = `
-    <section class="diagnostic-summary ${report.overall}" aria-label="诊断结论">
-      <i data-lucide="${report.overall === "healthy" ? "circle-check" : report.overall === "offline" ? "circle-x" : "shield-alert"}"></i>
+  stale: boolean,
+): string {
+  return `
+    <section class="diagnostic-summary ${stale ? "stale" : report.overall}" aria-label="${stale ? "上次诊断" : "诊断结论"}">
+      <i data-lucide="${stale ? "shield-alert" : report.overall === "healthy" ? "circle-check" : report.overall === "offline" ? "circle-x" : "shield-alert"}"></i>
       <div>
-        <strong>${diagnosticOverallLabel(report.overall)}</strong>
-        <p>${escapeHtml(report.summary)}</p>
+        <strong>${stale ? "上次诊断已过期" : diagnosticOverallLabel(report.overall)}</strong>
+        <p>${stale ? "连接状态已变化或无法确认，以下为历史结果，请重新诊断。" : escapeHtml(report.summary)}</p>
       </div>
       <time datetime="${escapeAttr(report.checkedAt)}">${formatTime(report.checkedAt)}</time>
     </section>
-    <div class="diagnostic-checks">
+    <div class="diagnostic-checks" aria-label="${stale ? "上次检查明细" : "本次检查明细"}">
       ${report.checks
         .map(
           (check) => `
-            <article class="diagnostic-check ${check.status}">
+            <article class="diagnostic-check ${stale ? "stale" : check.status}">
               <i data-lucide="${diagnosticCheckIcon(check.id)}"></i>
               <div>
                 <strong>${escapeHtml(check.title)}</strong>
@@ -518,7 +504,6 @@ function renderDiagnosticReport(
         )
         .join("")}
     </div>
-    ${error ? `<p class="status-error" role="alert">${escapeHtml(error)}</p>` : ""}
   `;
 }
 
@@ -548,6 +533,12 @@ function renderChannelDistribution(
   current: WifiNetwork | undefined,
 ): void {
   const root = mustGet<HTMLDivElement>("channelDistribution");
+
+  if (state.scanIssue) {
+    root.className = "channel-chart empty-state";
+    root.textContent = "扫描失败，周边分布暂不可用";
+    return;
+  }
 
   if (!distribution.length) {
     root.className = "channel-chart empty-state";
@@ -608,12 +599,12 @@ function renderCurve(state: AppState, network?: WifiNetwork): void {
 
   const points = state.history.get(network.bssid) ?? [{ time: Date.now(), dbm: network.signalDbm }];
   curveTitle.textContent = `${network.ssid} RSSI`;
-  curveMeta.textContent = `${network.band} | CH ${network.channel || "--"}`;
+  curveMeta.textContent = `${state.scanIssue ? `历史样本 · ${formatTime(state.scan!.scannedAt)} | ` : ""}${network.band} | CH ${network.channel || "--"}`;
   root.className = "curve";
   root.innerHTML = buildCurveSvg(points);
 }
 
-function renderSelectedDetail(network: WifiNetwork | undefined): void {
+function renderSelectedDetail(network: WifiNetwork | undefined, stale: boolean): void {
   const root = mustGet<HTMLDivElement>("selectedDetail");
   const previousBssid = root.dataset.bssid;
 
@@ -629,7 +620,7 @@ function renderSelectedDetail(network: WifiNetwork | undefined): void {
     <div><span>频段</span><strong>${network.band}</strong></div>
     <div><span>安全</span><strong>${escapeHtml(network.security)}</strong></div>
     <div><span>信号质量</span><strong>${network.quality}%</strong></div>
-    <div><span>系统状态</span><strong>${network.isConnected ? "当前使用" : "周边网络"}</strong></div>
+    <div><span>系统状态</span><strong>${stale ? "历史记录" : network.isConnected ? "当前使用" : "周边网络"}</strong></div>
   `;
   root.dataset.bssid = network.bssid;
 

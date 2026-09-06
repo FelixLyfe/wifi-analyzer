@@ -1,3 +1,4 @@
+mod command_text;
 mod diagnostics;
 mod wifi;
 
@@ -20,7 +21,7 @@ fn scan_wifi() -> Result<wifi::ScanResult, wifi::ScanError> {
 
 #[tauri::command(async)]
 fn diagnose_connection() -> diagnostics::ConnectionDiagnosticReport {
-    diagnostics::run(wifi::current_connection_name())
+    diagnostics::run(wifi::current_connection_identity())
 }
 
 #[tauri::command]

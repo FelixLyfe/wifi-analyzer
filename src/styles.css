@@ -720,6 +720,7 @@ h2 {
 
 .connection-status-list {
   display: grid;
+  grid-auto-rows: max-content;
   gap: 8px;
   align-content: start;
   flex: 1 1 auto;
@@ -833,6 +834,10 @@ h2 {
 
 .diagnostic-check.fail > svg {
   color: var(--red);
+}
+
+.diagnostic-check.stale > svg {
+  color: var(--muted);
 }
 
 .connection-status-item {
